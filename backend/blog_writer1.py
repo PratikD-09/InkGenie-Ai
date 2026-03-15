@@ -1,0 +1,795 @@
+# %%
+from __future__ import annotations
+from langgraph.graph import StateGraph, START, END
+from typing import TypedDict, Annotated
+from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_groq import ChatGroq 
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+
+# Standard library imports
+import random
+
+import operator
+import os
+import re
+from typing import TypedDict, List, Optional, Literal, Annotated
+
+from pydantic import BaseModel, Field
+
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Send
+
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_community.tools.tavily_search import TavilySearchResults
+from langsmith import traceable
+
+# %%
+import time
+import random
+import re
+from langchain_core.runnables import Runnable
+from langchain_core.messages import BaseMessage
+
+
+# %%
+from pydantic import BaseModel, Field
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Send
+from typing import List, Dict, Optional
+
+# %%
+
+def call_with_retry(
+    runnable: Runnable,
+    messages: list[BaseMessage],
+    max_retries: int = 5,
+    base_delay: float = 1.0
+):
+    """Invoke a runnable with retry logic for 429 rate‑limit errors."""
+    for attempt in range(max_retries):
+        try:
+            return runnable.invoke(messages)
+        except Exception as e:
+            error_str = str(e)
+            # Check if it's a rate‑limit error (429)
+            if "429" in error_str or "rate limit" in error_str.lower():
+                if attempt == max_retries - 1:
+                    raise  # Last attempt failed
+                # Extract suggested wait time from error message if present
+                wait_time = None
+                match = re.search(r"try again in ([\d.]+)s", error_str)
+                if match:
+                    wait_time = float(match.group(1))
+                    # Add jitter (±20%) to avoid synchronized retries
+                    wait_time *= (0.8 + 0.4 * random.random())
+                else:
+                    # Exponential backoff + jitter
+                    wait_time = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                print(f"Rate limit hit, retrying in {wait_time:.2f}s... (attempt {attempt+1}/{max_retries})")
+                time.sleep(wait_time)
+            else:
+                # Not a rate‑limit error – re‑raise immediately
+                raise
+
+# %%
+load_dotenv()
+apiKey = os.getenv("GROK_API_KEY")
+
+# %%
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+# Force LangSmith settings
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY", "")
+os.environ["LANGCHAIN_PROJECT"] = os.getenv("LANGCHAIN_PROJECT", "blog_workflow")
+
+# Optional: print confirmation
+print("LangSmith tracing enabled:", os.environ["LANGCHAIN_TRACING_V2"])
+print("Project:", os.environ["LANGCHAIN_PROJECT"])
+
+# %%
+class Task(BaseModel):
+    id: int
+    title: str
+
+    goal: str = Field(
+        ...,
+        description="One sentence describing what the reader should be able to do/understand after this section.",
+    )
+    bullets: List[str] = Field(
+        ...,
+        min_length=3,
+        max_length=6,
+        description="3–6 concrete, non-overlapping subpoints to cover in this section.",
+    )
+    target_words: int = Field(..., description="Target word count for this section (120–550).")
+
+    tags: List[str] = Field(default_factory=list)
+    requires_research: bool = False
+    requires_citations: bool = False
+    requires_code: bool = False
+
+
+class Plan(BaseModel):
+    blog_title: str
+    audience: str
+    tone: str
+    blog_kind: Literal["explainer", "tutorial", "news_roundup", "comparison", "system_design"] = "explainer"
+    constraints: List[str] = Field(default_factory=list)
+    tasks: List[Task]
+
+
+class EvidenceItem(BaseModel):
+    title: str
+    url: str
+    published_at: Optional[str] = None  # keep if Tavily provides; DO NOT rely on it
+    snippet: Optional[str] = None
+    source: Optional[str] = None
+
+
+class RouterDecision(BaseModel):
+    needs_research: bool
+    mode: Literal["closed_book", "hybrid", "open_book"]
+    queries: List[str] = Field(default_factory=list)
+
+
+class EvidencePack(BaseModel):
+    evidence: List[EvidenceItem] = Field(default_factory=list)
+
+# %%
+# Edit instruction schema
+class EditInstruction(BaseModel):
+    modified_tasks: List[int] = Field(description="IDs of tasks to rewrite")
+    new_titles: Optional[Dict[int, str]] = Field(default_factory=dict)
+    new_goals: Optional[Dict[int, str]] = Field(default_factory=dict)
+    new_bullets: Optional[Dict[int, List[str]]] = Field(default_factory=dict)
+
+# %%
+def update_sections(current: list[tuple[int, str]], new: list[tuple[int, str]]) -> list[tuple[int, str]]:
+    """
+    Reducer for the 'sections' field.
+    - If a section with the same task_id already exists, it is replaced.
+    - New sections (with new task_ids) are added.
+    - The final list is sorted by task_id to maintain a consistent order.
+    """
+    # Convert current list to a dict for easy update
+    sections_dict = {task_id: section for task_id, section in current}
+    # Update with new sections (overwrites existing keys)
+    for task_id, section in new:
+        sections_dict[task_id] = section
+    # Convert back to sorted list
+    return sorted(sections_dict.items(), key=lambda x: x[0])
+
+# %%
+
+class State(TypedDict):
+    topic: str
+
+    # routing / research
+    mode: str
+    needs_research: bool
+    queries: List[str]
+    evidence: List[EvidenceItem]
+    plan: Optional[Plan]
+
+    # workers
+    sections: Annotated[List[tuple[int, str]], update_sections]   # <-- replaced operator.add
+
+    # final merged markdown
+    merged_md: str
+    final: str
+
+    user_request: Optional[str]          # the user's edit request
+    edit_mode: bool                       # whether we are in an edit loop
+    original_plan: Optional[Plan]         # keep original plan for reference (optional)
+    
+    edit_instruction: Optional[EditInstruction]
+
+
+
+# %%
+llm = ChatGroq(
+    model="meta-llama/llama-4-scout-17b-16e-instruct",
+    temperature=0.7,
+    api_key=apiKey
+)
+
+
+# %%
+
+
+from langchain_core.messages import SystemMessage, HumanMessage
+from pydantic import ValidationError
+
+ROUTER_SYSTEM = """You are a routing module for a technical blog planner.
+Decide whether web research is needed BEFORE planning.
+
+Modes:
+- closed_book (needs_research=false): Evergreen topics where correctness does not depend on recent facts (concepts, fundamentals).
+- hybrid (needs_research=true): Mostly evergreen but needs up-to-date examples/tools/models to be useful.
+- open_book (needs_research=true): Mostly volatile: weekly roundups, "this week", "latest", rankings, pricing, policy/regulation.
+
+If needs_research=true:
+- Output 3–10 high-signal queries.
+- Queries should be scoped and specific (avoid generic queries like just "AI" or "LLM").
+- If user asked for "last week/this week/latest", reflect that constraint IN THE QUERIES.
+
+IMPORTANT: You must output a valid JSON object with exactly these fields:
+- needs_research: boolean (true or false, not strings)
+- mode: string (one of "closed_book", "hybrid", "open_book")
+- queries: list of strings (if needs_research is true, else empty list)
+
+Do NOT put quotes around true/false. Example: {"needs_research": true, "mode": "hybrid", "queries": ["query1", "query2"]}
+"""
+@traceable
+def router_node(state: State) -> dict:
+    topic = state["topic"]
+    decider = llm.with_structured_output(RouterDecision)
+
+    # Try up to 2 times with different prompts if validation fails
+    for attempt in range(2):
+        try:
+            decision = decider.invoke(
+                [
+                    SystemMessage(content=ROUTER_SYSTEM),
+                    HumanMessage(content=f"Topic: {topic}"),
+                ]
+            )
+            break  # success
+        except ValidationError as e:
+            if attempt == 0:
+                # On first failure, retry with an even more explicit instruction
+                decision = decider.invoke(
+                    [
+                        SystemMessage(content=ROUTER_SYSTEM + "\n\nCRITICAL: needs_research must be a boolean true or false, NOT a string. Do NOT use quotes around true/false."),
+                        HumanMessage(content=f"Topic: {topic}"),
+                    ]
+                )
+                break
+            else:
+                # Fallback: manually parse the raw output if all else fails
+                raw = llm.invoke(
+                    [
+                        SystemMessage(content="Output a JSON object with needs_research (boolean), mode (string), queries (list)."),
+                        HumanMessage(content=f"Topic: {topic}"),
+                    ]
+                ).content
+                import json, re
+                # Extract JSON from markdown if present
+                json_str = re.search(r'\{.*\}', raw, re.DOTALL).group()
+                data = json.loads(json_str)
+                # Convert string booleans
+                if isinstance(data.get("needs_research"), str):
+                    data["needs_research"] = data["needs_research"].lower() == "true"
+                decision = RouterDecision(**data)
+                break
+    else:
+        raise Exception("Failed to get valid router decision after retries.")
+
+    return {
+        "needs_research": decision.needs_research,
+        "mode": decision.mode,
+        "queries": decision.queries,
+    }    
+
+# %%
+
+@traceable
+def route_next(state: State) -> str:
+    return "research" if state["needs_research"] else "orchestrator"
+
+
+# %%
+@traceable
+def _tavily_search(query: str, max_results: int = 2) -> List[dict]:
+    
+    tool = TavilySearchResults(max_results=max_results)
+    results = tool.invoke({"query": query})
+
+    normalized: List[dict] = []
+    for r in results or []:
+        normalized.append(
+            {
+                "title": r.get("title") or "",
+                "url": r.get("url") or "",
+                "snippet": r.get("content") or r.get("snippet") or "",
+                "published_at": r.get("published_date") or r.get("published_at"),
+                "source": r.get("source"),
+            }
+        )
+    return normalized
+
+
+RESEARCH_SYSTEM = """You are a research synthesizer for technical writing.
+
+Given raw web search results, produce a deduplicated list of EvidenceItem objects.
+
+Rules:
+- Only include items with a non-empty url.
+- Prefer relevant + authoritative sources (company blogs, docs, reputable outlets).
+- If a published date is explicitly present in the result payload, keep it as YYYY-MM-DD.
+  If missing or unclear, set published_at=null. Do NOT guess.
+- Keep snippets short.
+- Deduplicate by URL.
+"""
+
+import json
+
+@traceable
+def research_node(state: State) -> dict:
+    # Limit queries and results to stay under token limits
+    queries = (state.get("queries", []) or [])[:3]      # use at most 3 queries
+    max_results = 3                                     # fewer results per query
+
+    raw_results: List[dict] = []
+
+    for q in queries:
+        results = _tavily_search(q, max_results=max_results)
+        # Truncate snippets to avoid huge token counts
+        for r in results:
+            if r.get("snippet"):
+                r["snippet"] = r["snippet"][:200]
+        raw_results.extend(results)
+
+    if not raw_results:
+        return {"evidence": []}
+
+    # Optionally limit total results (e.g., 15 max)
+    if len(raw_results) > 15:
+        raw_results = raw_results[:15]
+
+    # Compact JSON representation saves tokens
+    raw_json = json.dumps(raw_results, separators=(',', ':'))
+
+    extractor = llm.with_structured_output(EvidencePack)
+    pack = extractor.invoke(
+        [
+            SystemMessage(content=RESEARCH_SYSTEM),
+            HumanMessage(content=f"Raw results:\n{raw_json}"),
+        ]
+    )
+
+    # Deduplicate by URL
+    dedup = {}
+    for e in pack.evidence:
+        if e.url:
+            dedup[e.url] = e
+
+    return {"evidence": list(dedup.values())}
+
+
+# %%
+ORCH_SYSTEM = """You are a senior technical writer and developer advocate.
+Your job is to produce a highly actionable outline for a technical blog post.
+
+Hard requirements:
+- Create 5–9 sections (tasks) suitable for the topic and audience.
+- Each task must include:
+  1) goal (1 sentence)
+  2) 3–6 bullets that are concrete, specific, and non-overlapping
+  3) target word count (120–550)
+
+Quality bar:
+- Assume the reader is a developer; use correct terminology.
+- Bullets must be actionable: build/compare/measure/verify/debug.
+- Ensure the overall plan includes at least 2 of these somewhere:
+  * minimal code sketch / MWE (set requires_code=True for that section)
+  * edge cases / failure modes
+  * performance/cost considerations
+  * security/privacy considerations (if relevant)
+  * debugging/observability tips
+
+Grounding rules:
+- Mode closed_book: keep it evergreen; do not depend on evidence.
+- Mode hybrid:
+  - Use evidence for up-to-date examples (models/tools/releases) in bullets.
+  - Mark sections using fresh info as requires_research=True and requires_citations=True.
+- Mode open_book:
+  - Set blog_kind = "news_roundup".
+  - Every section is about summarizing events + implications.
+  - DO NOT include tutorial/how-to sections unless user explicitly asked for that.
+  - If evidence is empty or insufficient, create a plan that transparently says "insufficient sources"
+    and includes only what can be supported.
+
+Output must strictly match the Plan schema.
+"""
+@traceable
+def orchestrator_node(state: State) -> dict:
+    planner = llm.with_structured_output(Plan)
+
+    evidence = state.get("evidence", [])
+    mode = state.get("mode", "closed_book")
+    topic = state["topic"]
+
+    base_system = ORCH_SYSTEM
+    max_attempts = 3
+    last_exception = None
+
+    for attempt in range(max_attempts):
+        try:
+            system_msg = base_system
+            if attempt > 0:
+                # Add extra emphasis on bullet count after a failure
+                system_msg += (
+                    "\n\nIMPORTANT: Previous attempt generated tasks with fewer than 3 bullet points, "
+                    "which violates the schema. Each task's 'bullets' array MUST contain exactly 3-6 items. "
+                    "Please ensure compliance."
+                )
+
+            plan = planner.invoke(
+                [
+                    SystemMessage(content=system_msg),
+                    HumanMessage(
+                        content=(
+                            f"Topic: {topic}\n"
+                            f"Mode: {mode}\n\n"
+                            f"Evidence (ONLY use for fresh claims; may be empty):\n"
+                            f"{[e.model_dump() for e in evidence][:16]}"
+                        )
+                    ),
+                ]
+            )
+
+            # Manual validation of bullet counts (in case the LLM returns a valid schema but still violates min_length)
+            # for task in plan.tasks:
+            #     if len(task.bullets) < 3:
+            #         raise ValueError(f"Task {task.id} has only {len(task.bullets)} bullets, expected at least 3")
+            #     if len(task.bullets) > 6:
+            #         # Truncate if too many (should not happen with schema, but be safe)
+            #         task.bullets = task.bullets[:6]
+
+            # return {"plan": plan}
+            
+            for task in plan.tasks:
+                # If fewer than 3 bullets, pad intelligently
+                while len(task.bullets) < 3:
+                    task.bullets.append(
+                        f"Expand on practical implications of {task.title.lower()}."
+                    )
+
+                # If more than 6, truncate
+                if len(task.bullets) > 6:
+                    task.bullets = task.bullets[:6]
+            return {"plan": plan}
+
+        except Exception as e:
+            last_exception = e
+            if attempt == max_attempts - 1:
+                # Last attempt failed – we'll try to salvage by padding any short bullet lists
+                # But we don't have the plan here because the exception likely occurred before parsing.
+                # If the exception contains the failed generation, we could extract it, but it's complex.
+                # Instead, we raise the last exception.
+                raise last_exception
+            # Otherwise, retry
+            print(f"Orchestrator attempt {attempt+1} failed: {e}. Retrying...")
+            continue
+
+    # Should never reach here
+    raise last_exception or Exception("Failed to generate a valid plan after retries.")
+
+
+# %%
+@traceable
+def fanout(state: State):
+    return [
+        Send(
+            "worker",
+            {
+                "task": task.model_dump(),
+                "topic": state["topic"],
+                "mode": state["mode"],
+                "plan": state["plan"].model_dump(),
+                "evidence": [e.model_dump() for e in state.get("evidence", [])],
+            },
+        )
+        for task in state["plan"].tasks
+    ]
+
+
+# %%
+WORKER_SYSTEM = """You are a senior technical writer and developer advocate.
+Write ONE section of a technical blog post in Markdown.
+
+Hard constraints:
+- Follow the provided Goal and cover ALL Bullets in order (do not skip or merge bullets).
+- Stay close to Target words (±15%).
+- Output ONLY the section content in Markdown (no blog title H1, no extra commentary).
+- Start with a '## <Section Title>' heading.
+
+Scope guard:
+- If blog_kind == "news_roundup": do NOT turn this into a tutorial/how-to guide.
+  Do NOT teach web scraping, RSS, automation, or "how to fetch news" unless bullets explicitly ask for it.
+  Focus on summarizing events and implications.
+
+Grounding policy:
+- If mode == open_book:
+  - Do NOT introduce any specific event/company/model/funding/policy claim unless it is supported by provided Evidence URLs.
+  - For each event claim, attach a source as a Markdown link: ([Source](URL)).
+  - Only use URLs provided in Evidence. If not supported, write: "Not found in provided sources."
+- If requires_citations == true:
+  - For outside-world claims, cite Evidence URLs the same way.
+- Evergreen reasoning is OK without citations unless requires_citations is true.
+
+Code:
+- If requires_code == true, include at least one minimal, correct code snippet relevant to the bullets.
+
+Style:
+- Short paragraphs, bullets where helpful, code fences for code.
+- Avoid fluff/marketing. Be precise and implementation-oriented.
+"""
+@traceable
+def worker_node(payload: dict) -> dict:
+    
+    task = Task(**payload["task"])
+    plan = Plan(**payload["plan"])
+    evidence = [EvidenceItem(**e) for e in payload.get("evidence", [])]
+    topic = payload["topic"]
+    mode = payload.get("mode", "closed_book")
+
+    bullets_text = "\n- " + "\n- ".join(task.bullets)
+
+    evidence_text = ""
+    if evidence:
+        evidence_text = "\n".join(
+            f"- {e.title} | {e.url} | {e.published_at or 'date:unknown'}".strip()
+            for e in evidence[:20]
+        )
+
+    section_md = llm.invoke(
+        [
+            SystemMessage(content=WORKER_SYSTEM),
+            HumanMessage(
+                content=(
+                    f"Blog title: {plan.blog_title}\n"
+                    f"Audience: {plan.audience}\n"
+                    f"Tone: {plan.tone}\n"
+                    f"Blog kind: {plan.blog_kind}\n"
+                    f"Constraints: {plan.constraints}\n"
+                    f"Topic: {topic}\n"
+                    f"Mode: {mode}\n\n"
+                    f"Section title: {task.title}\n"
+                    f"Goal: {task.goal}\n"
+                    f"Target words: {task.target_words}\n"
+                    f"Tags: {task.tags}\n"
+                    f"requires_research: {task.requires_research}\n"
+                    f"requires_citations: {task.requires_citations}\n"
+                    f"requires_code: {task.requires_code}\n"
+                    f"Bullets:{bullets_text}\n\n"
+                    f"Evidence (ONLY use these URLs when citing):\n{evidence_text}\n"
+                )
+            ),
+        ]
+    ).content.strip()
+
+    return {"sections": [(task.id, section_md)]}
+
+# %%
+@traceable
+def merge_content(state: State) -> dict:
+
+    plan = state["plan"]
+
+    ordered_sections = [md for _, md in sorted(state["sections"], key=lambda x: x[0])]
+    body = "\n\n".join(ordered_sections).strip()
+    merged_md = f"# {plan.blog_title}\n\n{body}\n"
+
+    # Optionally write the markdown file
+    # filename = f"{plan.blog_title}.md"
+    # Path(filename).write_text(merged_md, encoding="utf-8")
+
+    return {"merged_md": merged_md, "final": merged_md}
+
+
+# %%
+def pass_plan(state: State) -> dict:
+    """Return the updated plan so it propagates to the main graph."""
+    return {"plan": state["plan"]}
+
+# %%
+
+
+
+
+# Edit planner node
+EDIT_PLANNER_SYSTEM = """You are an editor for a technical blog. 
+You will receive:
+- The current blog plan (list of sections with titles, goals, bullet points)
+- The user's change request
+
+Your job is to decide which sections must be updated and how.
+Output a valid JSON object with:
+- modified_tasks: list of integers (task IDs)
+- new_titles (optional): a dictionary where keys are task IDs as **strings** (e.g., "1") and values are the new titles.
+- new_goals (optional): similarly, keys as **strings** (e.g., "2") and values are the new goals.
+- new_bullets (optional): similarly, keys as **strings** (e.g., "3") and values are lists of bullet points.
+
+**IMPORTANT**: Always use string keys in dictionaries, even if they represent numbers. For example, use `"1": ["bullet1", "bullet2"]` **not** `1: ["bullet1", "bullet2"]`.
+
+Only include fields that actually change. Leave unchanged sections untouched.
+The new bullet lists must still have 3‑6 items.
+"""
+
+def edit_planner_node(state: State) -> dict:
+    """Takes current state and user_request, returns edit instructions."""
+    user_request = state.get("user_request")
+    if not user_request:
+        return {"edit_instruction": EditInstruction(modified_tasks=[])}  # no changes
+
+    plan = state["plan"]
+    tasks_summary = [
+        {"id": t.id, "title": t.title, "goal": t.goal, "bullets": t.bullets}
+        for t in plan.tasks
+    ]
+
+    planner_llm = llm.with_structured_output(EditInstruction)
+    instruction = planner_llm.invoke([
+        SystemMessage(content=EDIT_PLANNER_SYSTEM),
+        HumanMessage(content=f"Current plan:\n{tasks_summary}\n\nUser request: {user_request}")
+    ])
+    return {"edit_instruction": instruction}
+
+def apply_edit_node(state: State) -> dict:
+    """Applies the edit instruction to the plan and returns the updated plan."""
+    plan = state["plan"]
+    instruction = state["edit_instruction"]
+
+    updated_tasks = []
+    for task in plan.tasks:
+        if task.id in instruction.modified_tasks:
+            # Create a new Task with the changes
+            new_title = instruction.new_titles.get(task.id, task.title)
+            new_goal = instruction.new_goals.get(task.id, task.goal)
+            new_bullets = instruction.new_bullets.get(task.id, task.bullets)
+            updated_task = Task(
+                id=task.id,
+                title=new_title,
+                goal=new_goal,
+                bullets=new_bullets,
+                target_words=task.target_words,
+                tags=task.tags,
+                requires_research=task.requires_research,
+                requires_citations=task.requires_citations,
+                requires_code=task.requires_code,
+            )
+            updated_tasks.append(updated_task)
+        else:
+            updated_tasks.append(task)
+
+    updated_plan = Plan(
+        blog_title=plan.blog_title,
+        audience=plan.audience,
+        tone=plan.tone,
+        blog_kind=plan.blog_kind,
+        constraints=plan.constraints,
+        tasks=updated_tasks,
+    )
+    return {"plan": updated_plan}
+
+
+def fanout_edited_tasks(state: State) -> List[Send]:
+    """Sends each modified task to the worker using the updated plan."""
+    plan = state["plan"]          # already updated by apply_edit_node
+    instruction = state["edit_instruction"]
+    sends = []
+
+    for task_id in instruction.modified_tasks:
+        task = next((t for t in plan.tasks if t.id == task_id), None)
+        if task is None:
+            print(f"Warning: Task ID {task_id} not found in plan – skipping.")
+            continue
+        payload = {
+            "task": task.model_dump(),
+            "topic": state["topic"],
+            "mode": state["mode"],
+            "plan": plan.model_dump(),
+            "evidence": [e.model_dump() for e in state.get("evidence", [])],
+        }
+        sends.append(Send("worker", payload))
+
+    return sends
+
+
+edit_builder = StateGraph(State)
+edit_builder.add_node("edit_planner", edit_planner_node)
+edit_builder.add_node("apply_edit", apply_edit_node)      # new node
+edit_builder.add_node("worker", worker_node)
+edit_builder.add_node("merge_content", merge_content)
+
+
+edit_builder.add_node("pass_plan", pass_plan)
+
+edit_builder.add_edge(START, "edit_planner")
+edit_builder.add_edge("edit_planner", "apply_edit")
+edit_builder.add_conditional_edges("apply_edit", fanout_edited_tasks, ["worker"])
+edit_builder.add_edge("worker", "merge_content")
+edit_builder.add_edge("merge_content", "pass_plan")
+edit_builder.add_edge("pass_plan", END)
+
+
+
+
+
+edit_subgraph = edit_builder.compile()
+
+# %%
+edit_subgraph
+
+# %%
+# Define a node that does nothing but marks a place to interrupt
+def wait_for_feedback(state: State) -> dict:
+    """This node just returns the state unchanged; we'll interrupt before it."""
+    return {}
+
+# Router after feedback: decide whether to edit or end
+def after_feedback_router(state: State) -> Literal["edit_subgraph", "END"]:
+    if state.get("user_request") and state["user_request"].strip():
+        return "edit_subgraph"
+    return END
+
+
+# %%
+def clear_user_request(state: State) -> dict:
+    return {"user_request": None}
+
+# %%
+g = StateGraph(State)
+g.add_node("router", router_node)
+g.add_node("research", research_node)
+g.add_node("orchestrator", orchestrator_node)
+g.add_node("worker", worker_node)
+g.add_node("merge_content", merge_content)  
+g.add_node("clear_user_request", clear_user_request)
+
+
+g.add_node("wait_for_feedback", wait_for_feedback)
+g.add_node("edit_subgraph", edit_subgraph)   # add the compiled subgraph as a node
+
+
+
+g.add_edge(START, "router")
+g.add_conditional_edges("router", route_next, {"research": "research", "orchestrator": "orchestrator"})
+g.add_edge("research", "orchestrator")
+
+g.add_conditional_edges("orchestrator", fanout, ["worker"])
+g.add_edge("worker", "merge_content")
+# g.add_edge("merge_content", END)
+
+g.add_edge("merge_content", "wait_for_feedback")  # after merge, wait for feedback
+g.add_conditional_edges("wait_for_feedback", after_feedback_router, {
+    "edit_subgraph": "edit_subgraph",
+    END: END
+})
+# g.add_edge("edit_subgraph", "merge_content")  # after editing, re-merge and then wait again
+g.add_edge("edit_subgraph", "clear_user_request")
+g.add_edge("clear_user_request", "merge_content")
+
+
+
+# app  = g.compile()
+# print("LangGraph compiled successfully")
+
+# %%
+from langgraph.checkpoint.postgres import PostgresSaver
+from psycopg_pool import ConnectionPool
+
+# PostgreSQL connection string for Neon (use your actual credentials)
+# DB_URI = os.getenv("POSTGRES_URI", "postgresql://user:pass@your-neon-host/dbname")
+DB_URI = os.getenv("POSTGRES_URI")
+# Create a connection pool (sync)
+pool = ConnectionPool(DB_URI, max_size=20, kwargs={"autocommit": True})
+# Initialize the checkpointer
+checkpointer = PostgresSaver(pool)
+
+# Setup the database tables (run once)
+checkpointer.setup()  # creates the checkpoint tables if they don't exist
+
+# Compile the graph with the checkpointer
+# app = g.compile(checkpointer=checkpointer)
+app = g.compile(checkpointer=checkpointer, interrupt_before=["wait_for_feedback"])
+
+
+# %%
+app
