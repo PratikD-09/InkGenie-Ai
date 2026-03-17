@@ -779,12 +779,20 @@ from psycopg_pool import ConnectionPool
 # DB_URI = os.getenv("POSTGRES_URI", "postgresql://user:pass@your-neon-host/dbname")
 DB_URI = os.getenv("POSTGRES_URI")
 # Create a connection pool (sync)
-pool = ConnectionPool(DB_URI, max_size=20, kwargs={"autocommit": True})
-# Initialize the checkpointer
+pool = ConnectionPool(
+    conninfo=DB_URI,
+    max_size=10,              # reduce (Neon doesn't like too many connections)
+    timeout=30,               # wait for connection
+    kwargs={
+        "autocommit": True,
+        "connect_timeout": 30
+    }
+)# Initialize the checkpointer
 checkpointer = PostgresSaver(pool)
 
 # Setup the database tables (run once)
-checkpointer.setup()  # creates the checkpoint tables if they don't exist
+if os.getenv("RUN_DB_SETUP") == "true":
+    checkpointer.setup()  # creates the checkpoint tables if they don't exist
 
 # Compile the graph with the checkpointer
 # app = g.compile(checkpointer=checkpointer)
